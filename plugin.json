@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ryu.recipes",
+  "version": "0.1.14",
+  "description": "Desktop-automation recipes: record → save → replay UI action sequences. Backed by Ghost's RecipeStore, so it declares Ghost as a dependency and the graph refuses to disable Ghost out from under it.",
+  "author": {
+    "name": "Ryu",
+    "url": "https://ryuhq.com"
+  },
+  "homepage": "https://github.com/amajorai/ryu-recipes",
+  "repository": "https://github.com/amajorai/ryu-recipes",
+  "keywords": [
+    "automation",
+    "recipes",
+    "desktop",
+    "replay"
+  ],
+  "extensions": {
+    "com.ryuhq.ryu": {
+      "id": "@ryu/recipes",
+      "displayName": "Recipes"
+    }
+  }
+}
