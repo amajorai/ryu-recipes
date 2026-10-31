@@ -1,0 +1,366 @@
+//! `ryu-recipes` — the standalone, out-of-process recipes sidecar.
+//!
+//! Runs the extracted `ryu_recipes` capability crate (the `ghost-core`
+//! `RecipeStore` CRUD, the replay/record engine, and the `/api/recipes/*` HTTP
+//! surface defined in `api.rs`) as a SEPARATE PROCESS that Core spawns,
+//! health-checks, and proxies to on loopback — exactly like `ryu-teams`. The store
+//! and handlers live in the crate lib; this binary is only the process shell around
+//! them, so the SAME crate still compiles INTO Core in-process as a NON-optional
+//! path dependency (the workflow executor's `Recipe`/`GhostAction` nodes reach
+//! `run`/`extract_mcp_json` in every build). No code is duplicated.
+//!
+//! The crate's [`ryu_recipes::routes`] returns a state-baked, state-less
+//! `Router<()>` whose paths are RELATIVE to `/api/recipes` (Core nests it at that
+//! prefix in-process). This binary nests it under the same `/api/recipes` prefix,
+//! so the external paths are byte-identical to Core's in-process mount and the
+//! generic ext-proxy forwards `/api/recipes/*` to it unchanged.
+//!
+//! ## The live-Ghost coupling is PROXIED BACK to Core (not degraded)
+//! Recipes has two transports (see the crate root):
+//! - **Stateless CRUD** (list / show / save / delete) reads/writes the recipe JSON
+//!   files directly via `ghost-core`'s `RecipeStore`. This works FULLY in the
+//!   sidecar — no host, no Core.
+//! - **Replay** (`run`) and the **recording session** (`record/*`) need the LIVE
+//!   ghost engine: the shared MCP registry (to call `ghost.ghost_run`) and a
+//!   dedicated recording subprocess held across start..stop. Those are Core kernel
+//!   machinery, inverted through the [`RecipesHost`] trait. The sidecar owns
+//!   NEITHER, so it installs [`CoreCallback`] — every host method POSTs back to
+//!   Core's generic capability seam, `POST /api/host/capability/ghost.{replay,
+//!   recordStart,recordStatus,recordStop}` (ext-bearer authed, gated on the
+//!   `ghost:record` grant this manifest declares in `sidecars[].host_api.grants`),
+//!   where the live
+//!   [`ryu_recipes::RecipesHost`] impl runs against the real ghost engine. The
+//!   recording session is held in Core's process-global slot, so start..status..stop
+//!   spanning separate sidecar HTTP calls all reach the SAME session — the whole
+//!   `/api/recipes/*` surface (CRUD + run + record) is therefore genuinely
+//!   out-of-process; only the live-ghost machinery stays kernel-side in Core.
+//!
+//! ## Store location: Ghost's `services/ghost/recipes`, NOT the plugin data dir
+//! Unlike teams/mail/finetune (private SQLite DBs in their plugin data dirs), recipes
+//! SHARES `apps/ghost`'s on-disk store: `<data dir>/services/ghost/recipes/` (or
+//! `$GHOST_DATA_DIR/recipes`). Keeping a private copy would make Core and
+//! `apps/ghost` disagree about where a recipe lives — and ghost is what records AND
+//! replays, so they must agree.
+//!
+//! SECURITY: loopback-only bind (127.0.0.1) + a shared-secret bearer gate
+//! (`RYU_EXT_TOKEN`, injected by Core at spawn and presented on every proxied hop).
+//! EVERY `/api/recipes/*` route is protected — recipes has NO public surface. The
+//! gate is FAIL-CLOSED: with no token configured every protected route rejects with
+//! 401. `/health` is the ONE un-gated route (loopback probe, returns no recipe
+//! data), so Core's pre-auth health check succeeds — mirroring `ryu-teams`.
+//!
+//! Port: `RYU_RECIPES_PORT` env, default `7999`.
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use axum::{
+    extract::Request,
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{from_fn, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
+use serde_json::json;
+use serde_json::Value;
+
+use ryu_recipes::{
+    routes, set_global_host, RecipesCtx, RecipesHost, RecorderStarted, RecorderStatus,
+    RecorderStopped,
+};
+
+/// Default loopback port for the recipes sidecar (overridable via
+/// `RYU_RECIPES_PORT`). Distinct from finetune (7990), quests (7991), clips
+/// (7992), browser (7993), teams (7994), research (7995), mail (7996), and
+/// dashboards (7997).
+const DEFAULT_PORT: u16 = 7999;
+
+/// The built-in Recipes app id (matches the `recipes.manifest.json` fixture id and
+/// Core's `plugins::builtins::RECIPES_PLUGIN_ID`). Presented on the
+/// `x-ryu-plugin-id` header of every host callback so Core can recompute the
+/// expected ext token.
+const RECIPES_PLUGIN_ID: &str = "@ryu/recipes";
+
+/// The `x-ryu-plugin-id` header Core's `authenticate_sidecar` reads — mirrors
+/// `apps/core/src/sidecar/ext_proxy.rs::HDR_PLUGIN_ID`.
+const HDR_PLUGIN_ID: &str = "x-ryu-plugin-id";
+
+/// Core's default loopback port (release). The sidecar prefers the injected
+/// `RYU_CORE_PORT` (profile-shifted by Core); this is the last-resort fallback.
+const DEFAULT_CORE_PORT: u16 = 7980;
+
+/// The sidecar's [`RecipesHost`] — a PROXY back into Core, not a local
+/// implementation. Replay (`run`) and the recording session (`record/*`) need the
+/// live ghost engine: the shared MCP registry and a dedicated recording subprocess
+/// held across start..stop. Both are Core kernel machinery the sidecar does not
+/// own, so every method POSTs back to Core's kernel capabilities
+/// (`/api/host/capability/ghost.*`, gated on the declared `ghost:record` grant), where
+/// the real [`RecipesHost`] impl runs against the live engine. The recording
+/// session is held in Core's process-global slot, so start..status..stop across
+/// separate sidecar calls all reach the SAME session. The stateless CRUD surface
+/// never touches the host, so it works fully in-sidecar; the live-ghost paths ride
+/// this callback.
+struct CoreCallback {
+    /// Core's loopback base URL (`http://127.0.0.1:<RYU_CORE_PORT>`), resolved once.
+    core_base: String,
+    /// The injected ext bearer (`RYU_EXT_TOKEN`) presented on every callback. `None`
+    /// leaves the callbacks disabled fail-closed (they will be rejected by Core).
+    ext_token: Option<String>,
+    http: reqwest::Client,
+}
+
+/// Core's loopback port, from the `RYU_CORE_PORT` Core injects at spawn (it is
+/// profile-shifted, so the constant is only the last-resort fallback for a bare
+/// run). One function because two callers need the SAME answer: the host callback
+/// and the `RYU_BIND` seed below.
+fn core_port() -> u16 {
+    std::env::var("RYU_CORE_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(DEFAULT_CORE_PORT)
+}
+
+impl CoreCallback {
+    fn new() -> Self {
+        let core_port = core_port();
+        let ext_token = std::env::var("RYU_EXT_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        Self {
+            core_base: format!("http://127.0.0.1:{core_port}"),
+            ext_token,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// POST a JSON body to a Core host-callback path with the ext-bearer +
+    /// plugin-id headers `authenticate_sidecar` expects. Returns the parsed JSON
+    /// body on 2xx (Core returns the RAW trait-level result); maps a non-2xx into
+    /// the error message Core surfaced.
+    async fn post(&self, path: &str, body: Value) -> Result<Value> {
+        let token = self
+            .ext_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no RYU_EXT_TOKEN configured for Core callback"))?;
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.core_base))
+            .bearer_auth(token)
+            .header(HDR_PLUGIN_ID, RECIPES_PLUGIN_ID)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("core callback not reachable: {e}"))?;
+        let status = resp.status();
+        let parsed: Value = resp.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            Ok(parsed)
+        } else {
+            Err(anyhow::anyhow!(parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!(
+                    "core callback failed: HTTP {status}"
+                ))))
+        }
+    }
+}
+
+#[async_trait]
+impl RecipesHost for CoreCallback {
+    async fn call_ghost_run(&self, recipe: &str, params: Value) -> Result<Value> {
+        // Core returns the RAW ghost MCP `tools/call` envelope; the crate's `run()`
+        // wrapper unwraps it with `extract_mcp_json` (do NOT unwrap here — that is
+        // the crate's job, identical to the in-process path).
+        self.post(
+            "/api/host/capability/ghost.replay",
+            json!({ "recipe": recipe, "params": params }),
+        )
+        .await
+    }
+
+    async fn recorder_start(&self, task: &str) -> Result<RecorderStarted> {
+        let raw = self
+            .post(
+                "/api/host/capability/ghost.recordStart",
+                json!({ "task": task }),
+            )
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| anyhow::anyhow!("malformed RecorderStarted from Core: {e}"))
+    }
+
+    async fn recorder_status(&self) -> Result<Option<RecorderStatus>> {
+        let raw = self
+            .post("/api/host/capability/ghost.recordStatus", json!({}))
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| anyhow::anyhow!("malformed RecorderStatus from Core: {e}"))
+    }
+
+    async fn recorder_stop(&self) -> Result<RecorderStopped> {
+        let raw = self
+            .post("/api/host/capability/ghost.recordStop", json!({}))
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| anyhow::anyhow!("malformed RecorderStopped from Core: {e}"))
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let port: u16 = std::env::var("RYU_RECIPES_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+
+    // The app-event emit client (`ryu-app-events`) addresses Core through
+    // `RYU_BIND`, but a sidecar's injected env carries only `RYU_CORE_PORT`, and Core
+    // exports no `RYU_BIND` of its own outside the dev profile — so without this the
+    // `recording.ended` / `replay.*` events this manifest declares would silently
+    // no-op in exactly the build users run. Set unconditionally rather than only when
+    // unset: an inherited `RYU_BIND` is Core's LISTEN address, which may be
+    // `0.0.0.0:<port>` (a dial target that is invalid on Windows), while every
+    // sidecar→Core hop is by construction loopback — the same address+port
+    // `CoreCallback` uses.
+    std::env::set_var("RYU_BIND", format!("127.0.0.1:{}", core_port()));
+
+    // Install the Core-callback host once at boot so the replay/record routes proxy
+    // back to Core's `/api/host/capability/ghost.*` kernel capabilities (where the
+    // live ghost engine runs)
+    // instead of the crate's default "recipes host not initialized". Idempotent.
+    set_global_host(Arc::new(CoreCallback::new()));
+
+    // Shared-secret bearer Core injects via the generic ext-proxy loader
+    // (`RYU_EXT_TOKEN`) — the per-plugin minted secret it stamps on every proxied
+    // hop + the health probe. The protected `/api/recipes/*` routes require it.
+    let token = std::env::var("RYU_EXT_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    if token.is_some() {
+        tracing::info!(
+            "ryu-recipes: protected /api/recipes/* routes require the injected shared-secret bearer"
+        );
+    } else {
+        tracing::warn!(
+            "ryu-recipes: no RYU_EXT_TOKEN set; protected /api/recipes/* routes are FAIL-CLOSED (reject all). Core injects this token when it spawns the sidecar."
+        );
+    }
+
+    // The crate router (paths relative to `/api/recipes`) nested under the external
+    // prefix, with the shared-secret gate layered over the whole nest — recipes has
+    // no public route. `from_fn` closes over the resolved token so no extra state
+    // field is needed.
+    //
+    // `/openapi.json` rides INSIDE that same gate, at the SERVER ROOT. Core fetches
+    // `http://127.0.0.1:<port>/openapi.json` on this sidecar's first Healthy edge and
+    // lowers every operation it finds into searchable LLM tools, so routing this one
+    // endpoint is what makes the whole `/api/recipes` surface callable by an agent
+    // (`ryu_recipes::api::openapi()` was dead code until now — only tests read it).
+    //
+    // Root, not under `/api/recipes`: Core tries the root FIRST and only falls back to
+    // the mount-prefixed form, and keeping the document off the mount keeps it out of
+    // the manifest's declared `http.routes[]` — anything declared there is reachable
+    // through the generic ext-proxy, and the schema is Core's to read, not an app
+    // surface. Inside the gate, not next to the un-gated `/health`: Core stamps the
+    // injected `RYU_EXT_TOKEN` on the fetch (the Python sidecars already require the
+    // bearer for everything but `/health`), so the gate costs the fetcher nothing —
+    // while un-gated it would disclose this app's entire internal API surface to any
+    // other process on loopback.
+    let recipes_api = routes(RecipesCtx::new());
+
+    // `/health` sits OUTSIDE the gated nest so the loopback health probe succeeds
+    // before auth. It asserts the recipe store is readable (a cheap `list`, which
+    // `create_dir_all`s the store dir on a fresh machine → `[]`, never an error) and
+    // returns no recipe data.
+    let app = app_router(
+        Router::new().route("/health", get(health)),
+        recipes_api,
+        token,
+    );
+
+    // LOOPBACK ONLY (belt) + shared-secret bearer (suspenders): Core is the auth
+    // front and re-stamps the bearer on the proxied hop.
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("ryu-recipes sidecar listening on http://{addr}");
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Loopback health probe: asserts the recipe store is readable (a cheap `list`) so
+/// health also confirms store readiness, not just process liveness. Un-gated and
+/// data-free (returns only a count).
+async fn health() -> Response {
+    match ryu_recipes::list() {
+        Ok(recipes) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "recipeCount": recipes.len() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// The served router: the un-gated `health_route` merged with `/api/recipes/*` and the
+/// root `/openapi.json`, both behind [`require_recipes_token`]. Split out of `main` so the gate
+/// wiring itself (what is protected, what is not) is under test.
+fn app_router(health_route: Router, api: Router, token: Option<String>) -> Router {
+    let protected = Router::new()
+        .nest("/api/recipes", api)
+        .route(
+            "/openapi.json",
+            get(|| async { Json(ryu_recipes::api::openapi()) }),
+        )
+        .layer(from_fn(move |req: Request, next: Next| {
+            let expected = token.clone();
+            async move { require_recipes_token(req, next, expected.as_deref()).await }
+        }));
+    health_route.merge(protected)
+}
+
+/// Shared-secret bearer gate for the proxied `/api/recipes/*` surface. Core stays
+/// the auth front — it runs `require_auth`, then re-stamps `Authorization: Bearer
+/// <RYU_EXT_TOKEN>` on the loopback hop — so a request that did NOT come through
+/// Core (any other local process on a shared host) is rejected with 401.
+///
+/// **Fail-closed:** `expected == None`/empty (no token configured) rejects every
+/// request rather than falling open, so a bare-run or misconfigured sidecar never
+/// serves recipe data unauthenticated.
+async fn require_recipes_token(req: Request, next: Next, expected: Option<&str>) -> Response {
+    let provided = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if ryu_sidecar_runtime::token_ok(provided, expected) {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
+}
+
+#[cfg(test)]
+#[path = "main_test.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "gate_tests.rs"]
+mod gate_tests;
